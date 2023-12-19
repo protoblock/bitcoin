@@ -304,6 +304,20 @@ public:
     virtual ~BaseSignatureChecker() {}
 };
 
+/**
+ * Class for performing signature checking on an arbitrary length message
+ */
+class MessageSignatureChecker : public BaseSignatureChecker
+{
+private:
+    const Span<const unsigned char> msg;
+
+public:
+    MessageSignatureChecker(const Span<const unsigned char> msgIn) : msg(msgIn) {}
+    bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;
+    bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
+};
+
 /** Enum to specify what *TransactionSignatureChecker's behavior should be
  *  when dealing with missing transaction data.
  */

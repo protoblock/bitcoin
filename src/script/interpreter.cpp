@@ -626,7 +626,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
-                case OP_NOP1: case OP_NOP5:
+                case OP_NOP1:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -1254,6 +1254,51 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
 
                     stack.push_back(std::vector<unsigned char>{execdata.m_internal_key.begin(), execdata.m_internal_key.end()});
+                    break;
+                }
+
+                case OP_CHECKSIGFROMSTACK:
+                case OP_CHECKSIGFROMSTACKVERIFY: {
+                    // if flags not enabled; treat OP_CHECKSIGFROMSTACKVERIFY as a NOP5
+                    if (opcode == OP_CHECKSIGFROMSTACKVERIFY && !(flags & SCRIPT_VERIFY_CTVCSFSINTERNALKEY)) {
+                        break;
+                    }
+                    // OP_CHECKSIGFROMSTACK is only available in Tapscript
+                    if (opcode == OP_CHECKSIGFROMSTACK && (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0)) {
+                        return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    }
+
+                    // sig data pubkey
+                    if (stack.size() < 3)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    valtype& vchSigIn = stacktop(-3);
+                    valtype& vchData = stacktop(-2);
+                    valtype& vchPubKey = stacktop(-1);
+
+                    std::vector<unsigned char> vchSig;
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) {
+                        // Push SIGHASH_ALL to pass checks - stripped by MessageSignatureChecker
+                        vchSig = std::vector<unsigned char>(vchSigIn.begin(), vchSigIn.begin() + vchSigIn.size());
+                        vchSig.push_back(SIGHASH_ALL);
+                    } else {
+                        vchSig = vchSigIn;
+                    }
+
+                    bool fSuccess = true;
+                    MessageSignatureChecker checker{vchData};
+
+                    if (!EvalChecksig(vchSig, vchPubKey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, fSuccess)) return false;
+
+                    if (opcode == OP_CHECKSIGFROMSTACKVERIFY) {
+                        if (!fSuccess) return set_error(serror, SCRIPT_ERR_CHECKSIGVERIFY);
+                        break;
+                    }
+
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(fSuccess ? vchTrue : vchFalse);
                     break;
                 }
 
@@ -1918,6 +1963,43 @@ bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
 
+bool MessageSignatureChecker::CheckECDSASignature(const std::vector<unsigned char>& vchSigIn, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const
+{
+    valtype vchHash(CSHA256::OUTPUT_SIZE);
+    CSHA256().Write(this->msg.data(), this->msg.size()).Finalize(vchHash.data());
+
+    CPubKey pubkey(vchPubKey);
+    if (!pubkey.IsValid())
+        return false;
+
+    // Strip dummy SIGHASH_ALL added to pass format checks
+    std::vector<unsigned char> vchSig(vchSigIn);
+    if (vchSig.empty())
+        return false;
+    vchSig.pop_back();
+
+    if (!pubkey.Verify(uint256(vchHash), vchSig))
+        return false;
+
+    return true;
+}
+
+bool MessageSignatureChecker::CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey_in, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const
+{
+    assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
+    // Schnorr signatures have 32-byte public keys. The caller is responsible for enforcing this.
+    assert(pubkey_in.size() == 32);
+    // Note that in Tapscript evaluation, empty signatures are treated specially (invalid signature that does not
+    // abort script execution). This is implemented in EvalChecksigTapscript, which won't invoke
+    // CheckSchnorrSignature in that case. In other contexts, they are invalid like every other signature with
+    if (sig.size() != 64) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG_SIZE);
+
+    XOnlyPubKey pubkey{pubkey_in};
+
+    if (!pubkey.VerifySchnorr(this->msg, sig)) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG);
+    return true;
+}
+
 static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)
 {
     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};
@@ -1931,7 +2013,7 @@ static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CS
                 // Note how this condition would not be reached if an unknown OP_SUCCESSx was found
                 return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
-            if (flags & SCRIPT_VERIFY_CTVCSFSINTERNALKEY && opcode == OP_INTERNALKEY) {
+            if (flags & SCRIPT_VERIFY_CTVCSFSINTERNALKEY && (opcode == OP_CHECKSIGFROMSTACK || opcode == OP_INTERNALKEY)) {
                 continue;
             }
             // New opcodes will be listed here. May use a different sigversion to modify existing opcodes.
